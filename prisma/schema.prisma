@@ -1,0 +1,593 @@
+// Prisma schema — ExtraBat.
+// Prisma 7: the datasource connection URL lives in prisma.config.ts, not here.
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ASSISTANTE
+  CONDUCTEUR
+  ADMIN
+  OUVRIER // compte terrain lié à une fiche Ouvrier (Ouvrier.userId)
+}
+
+enum DossierStatut {
+  NOUVEAU
+  PLANIFIE
+  REALISE
+  EN_ATTENTE_HUMIDITE
+  PRET_POUR_TRAVAUX
+  EN_CHANTIER // pris en charge par le planning chantier (chantier non terminé)
+  TERMINE // travaux terminés — dossier clos
+  ANNULE // annulé avant travaux (motif dans annulationMotif) — réversible via reprise
+}
+
+enum VisiteStatut {
+  PLANIFIEE
+  REALISEE
+}
+
+// Abonnement SaaS de l'organisation (facturation Stripe). La source de vérité
+// est Stripe : ces valeurs ne sont qu'un MIROIR mis à jour par webhooks (+
+// réconciliation à l'ouverture de la page Abonnement) — jamais saisi par un
+// utilisateur, même philosophie que Visite.numero. SUSPENDU est surtout DÉRIVÉ
+// paresseusement (impayeDepuis + GRACE_JOURS écoulés, lib/abonnement.ts).
+enum StatutAbonnement {
+  EXONERE // pas de facturation Stripe (démo, arrangement manuel, dev) — défaut
+  ACTIF // abonnement en cours, payé
+  IMPAYE // échec de paiement, délai de grâce en cours — accès complet + bandeau
+  SUSPENDU // grâce expirée — lecture seule
+  RESILIE // abonnement annulé — lecture seule
+}
+
+model Organisation {
+  id        String   @id @default(uuid())
+  nom       String
+  createdAt DateTime @default(now())
+
+  // Coordonnées (compte-rendu imprimable) + logo : chemin d'objet du bucket
+  // privé Storage (PAS une URL publique) — même pattern que Photo.chemin.
+  adresse String?
+  siret   String?
+  logoUrl String?
+
+  // Identité étendue affichée sur le compte-rendu imprimable (tous optionnels —
+  // additifs, un compte-rendu existant reste valide sans eux).
+  telephone          String? // téléphone de l'entreprise (en-tête du compte-rendu)
+  emailContact       String? // email affiché aux clients
+  siteWeb            String?
+  assuranceDecennale String? // n° de police / assureur (pied de compte-rendu)
+  mentionsLegales    String? // bloc libre imprimé en pied de compte-rendu
+
+  // Bornes d'affichage du planning (minutes depuis minuit) + fallback pour un
+  // conducteur sans HoraireRecurrent. 480 = 8h00, 1080 = 18h00.
+  heureOuverture Int @default(480)
+  heureFermeture Int @default(1080)
+
+  // Durée par défaut proposée au formulaire de planification (copiée dans la
+  // Visite à la création, jamais recalculée ensuite).
+  dureeVisiteDefautMinutes Int @default(60)
+
+  // Règles métier personnalisables. Défauts = anciennes constantes en dur
+  // (lib/metier : SEUIL_HUMIDITE=25, DELAI_SECHAGE_JOURS=30) — une org qui n'y
+  // touche jamais se comporte comme avant. Seuil d'humidité (%) au-delà duquel
+  // le classement suggéré passe en attente de séchage ; délai (jours) conseillé
+  // avant contre-visite.
+  seuilHumidite     Int @default(25)
+  delaiSechageJours Int @default(30)
+
+  // Préférences d'affichage du back-office (vue liste des dossiers). Whitelist
+  // validée côté action — "kanban" | "liste" et un tri de TRIS_LISTE.
+  vueDossiersDefaut String @default("kanban")
+  triDossiersDefaut String @default("priorite")
+
+  // Abonnement SaaS (miroir Stripe — voir enum StatutAbonnement). EXONERE par
+  // défaut : indispensable pour le dev, le seed et ISO-BAT tant que la bascule
+  // commerciale n'est pas actée. Chargé par getCurrentUser() avec le reste de
+  // l'organisation : lire le statut ne coûte aucune requête supplémentaire.
+  statutAbonnement     StatutAbonnement @default(EXONERE)
+  stripeCustomerId     String?          @unique
+  stripeSubscriptionId String?          @unique
+  impayeDepuis         DateTime? // 1er échec de paiement (départ du délai de grâce)
+  suspenduLe           DateTime? // passage effectif en lecture seule
+
+  users             User[]
+  dossiers          Dossier[]
+  membresAutorises  MembreAutorise[]
+  ouvriers          Ouvrier[]
+  chantiers         Chantier[]
+}
+
+// Liste d'autorisation : seuls les emails présents ici peuvent être provisionnés
+// à la 1re connexion (avec le rôle prévu). Tout autre email connecté est refusé.
+// Remplace l'ancien auto-rattachement ouvert. Email stocké en minuscules.
+model MembreAutorise {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  role      Role     @default(CONDUCTEUR)
+  createdAt DateTime @default(now())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+
+  // Liaison compte ↔ fiche Ouvrier (rôle OUVRIER uniquement) : posée par
+  // « Donner un accès » depuis Paramètres → Ouvriers ; au provisioning de la
+  // 1re connexion, Ouvrier.userId est écrit dans la MÊME transaction que le
+  // user.create (lib/auth.ts). Unique : une fiche = au plus un email autorisé.
+  ouvrierId String?  @unique
+  ouvrier   Ouvrier? @relation(fields: [ouvrierId], references: [id])
+
+  @@index([organisationId])
+}
+
+model User {
+  // id = Supabase Auth user id (auth.users.id). Provided at creation, never generated here.
+  id        String   @id
+  email     String   @unique
+  nom       String
+  role      Role     @default(CONDUCTEUR)
+  createdAt DateTime @default(now())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+
+  dossiersCrees Dossier[]          @relation("DossierCreatedBy")
+  visites       Visite[]           @relation("VisiteConducteur")
+  horaires      HoraireRecurrent[] @relation("HoraireConducteur")
+  absences      Absence[]          @relation("AbsenceConducteur")
+  notesDossier  NoteDossier[]      @relation("NoteAuteur")
+  evenements    EvenementDossier[] @relation("EvenementActeur")
+  notifications Notification[]     @relation("NotificationDestinataire")
+  piecesJointes PieceJointe[]      @relation("PieceJointeAuteur")
+
+  // Fiche Ouvrier liée (rôle OUVRIER uniquement) — l'accès terrain passe par
+  // elle : requireOuvrier() exige ficheOuvrier.actif.
+  ficheOuvrier      Ouvrier?          @relation("OuvrierCompte")
+  documentsAjoutes  DocumentASigner[] @relation("DocumentASignerAuteur")
+  documentsSignes   DocumentASigner[] @relation("DocumentASignerSignataire")
+
+  @@index([organisationId])
+}
+
+// Plage horaire travaillée récurrente d'un conducteur (ex. lundi 8h–12h).
+// Scoping org : via le conducteur (User), qui porte organisationId — toute
+// requête passe par un conducteur vérifié de l'org.
+model HoraireRecurrent {
+  id           String @id @default(uuid())
+  conducteurId String
+  conducteur   User   @relation("HoraireConducteur", fields: [conducteurId], references: [id], onDelete: Cascade)
+
+  jourSemaine Int // 1 (lundi) … 7 (dimanche), convention ISO
+  heureDebut  Int // minutes depuis minuit (480 = 8h00) — évite les pièges TZ des Time
+  heureFin    Int
+
+  @@unique([conducteurId, jourSemaine, heureDebut])
+  @@index([conducteurId])
+  @@index([conducteurId, jourSemaine])
+}
+
+// Absence d'un conducteur en jours entiers (congés, maladie…).
+model Absence {
+  id           String @id @default(uuid())
+  conducteurId String
+  conducteur   User   @relation("AbsenceConducteur", fields: [conducteurId], references: [id], onDelete: Cascade)
+
+  dateDebut DateTime // normalisé à minuit Europe/Paris, début inclus
+  dateFin   DateTime // idem, fin incluse
+  motif     String? // ≤ 200 caractères
+  createdAt DateTime @default(now())
+
+  @@index([conducteurId, dateDebut])
+}
+
+model Dossier {
+  id         String        @id @default(uuid())
+  nomClient  String
+  adresse    String
+  telephone  String
+  email      String? // second canal de contact du client — optionnel
+  infosAcces String? // texte libre : étage, code interphone…
+  statut     DossierStatut @default(NOUVEAU)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  // Date du DERNIER classement en EN_ATTENTE_HUMIDITE (posée par
+  // confirmerClassement, nullée si classement PRET_POUR_TRAVAUX). Survit au
+  // cycle planifier→annuler : si une contre-visite annulée re-dérive le statut
+  // en EN_ATTENTE_HUMIDITE, la date d'origine du séchage reste valable.
+  classeHumiditeLe DateTime?
+
+  // Dernier empêchement signalé par le conducteur (client absent, accès
+  // impossible…) : la visite planifiée est supprimée (comme une annulation),
+  // l'empêchement reste ici jusqu'à la prochaine planification qui nulle les
+  // deux champs. L'historique complet (qui, quand, motif, date prévue) vit
+  // dans EvenementDossier.
+  empechementLe    DateTime?
+  empechementMotif String?
+
+  // Annulation du dossier (statut ANNULE) : posés par annulerDossier, nullés
+  // par reprendreDossier. Seul le DERNIER motif vit ici — l'historique complet
+  // (qui, quand, statut avant) est dans le journal (DOSSIER_ANNULE /
+  // DOSSIER_REPRIS). classeHumiditeLe/empechement* sont CONSERVÉS pendant
+  // l'annulation (utiles à la reprise).
+  annuleLe        DateTime?
+  annulationMotif String?
+
+  // Géocodage best-effort de `adresse` (API Adresse BAN, lib/geocodage.ts) —
+  // null si jamais tenté ou si le score est sous le seuil de confiance
+  // (traité comme "non géocodé" par le planning, corrigible en rééditant
+  // l'adresse). departement = code à 2-3 chiffres extrait du contexte BAN
+  // (ex. "77"), pour des badges lisibles sans géocodage inverse.
+  latitude       Float?
+  longitude      Float?
+  geocodageScore Float?
+  departement    String?
+
+  // Volet financier — MIROIR du devis fait sur Tolteck (source de vérité
+  // externe : lignes, TVA, PDF, envoi). ExtraBat ne stocke que le résultat.
+  // Montants en CENTIMES (Int) — jamais de Float pour l'argent (arrondis) ;
+  // l'affichage formate en euros (lib/finances.ts). Un dossier peut ne rien
+  // porter (devis non encore saisi) — tous nullables.
+  montantDevis Int? // montant HT total du devis, en centimes
+  franchise    Int? // part à la charge du client (informatif), en centimes
+  refDevis     String? // n° du devis Tolteck — pour retracer côté Tolteck
+  // payeLe est un FAIT, pas un statut : le CA « réalisé » est dérivé
+  // (payeLe != null), comme l'avancement d'un chantier dérive de ses dates.
+  // Posé/enlevé par action explicite (marquerPaye / annulerPaiement), jamais
+  // couplé au marquage « terminé » du chantier (le règlement arrive après).
+  payeLe DateTime?
+
+  // Multi-tenant: tout dossier appartient à une organisation.
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+
+  createdById String
+  createdBy   User   @relation("DossierCreatedBy", fields: [createdById], references: [id])
+
+  visites          Visite[]
+  chantier         Chantier? // 1 chantier max par dossier (planning travaux)
+  notes            NoteDossier[]
+  evenements       EvenementDossier[]
+  notifications    Notification[]
+  piecesJointes    PieceJointe[]
+  documentsASigner DocumentASigner[]
+
+  @@index([organisationId, statut, classeHumiditeLe])
+  // Tri des colonnes kanban et de la vue liste filtrée par statut :
+  // where (org, statut) + orderBy updatedAt — l'index (org, statut,
+  // classeHumiditeLe) couvre le filtre mais pas le tri.
+  @@index([organisationId, statut, updatedAt])
+  // Tri par défaut de la vue liste et de la file « à planifier » (updatedAt).
+  @@index([organisationId, updatedAt])
+  // Répartition par département de la page Statistiques (groupBy).
+  @@index([organisationId, departement])
+  // Vue Chiffre d'affaires : payés groupés par mois (payeLe non nul) et
+  // « à encaisser » (payeLe null) — filtrés/triés par organisation + payeLe.
+  @@index([organisationId, payeLe])
+  // Recherche « contient » (ILIKE %q%) de la recherche d'historique conducteur
+  // et des filtres dossiers : GIN trigram (extension pg_trgm, créée dans la
+  // migration recherche_trigram_dossier).
+  @@index([nomClient(ops: raw("gin_trgm_ops")), adresse(ops: raw("gin_trgm_ops")), telephone(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+model Visite {
+  id                     String       @id @default(uuid())
+  numero                 Int // 1-based ; le label est dérivé côté app
+  datePlanifiee          DateTime // début du créneau
+  dureeMinutes           Int          @default(60)
+  dateRealisee           DateTime? // horodatée à l'envoi du conducteur, jamais saisie
+  statut                 VisiteStatut @default(PLANIFIEE)
+  piecesEndommagees      String[]
+  tauxHumidite           Int? // 0-100
+  joursReparationEstimes Int?
+  resume                 String?
+  conclusion             String?
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  dossierId String
+  dossier   Dossier @relation(fields: [dossierId], references: [id], onDelete: Cascade)
+
+  conducteurId String
+  conducteur   User   @relation("VisiteConducteur", fields: [conducteurId], references: [id])
+
+  photos Photo[]
+
+  // Garantit l'unicité du numéro par dossier (protège l'auto-incrément et le forçage manuel).
+  @@unique([dossierId, numero])
+  @@index([dossierId, statut])
+  // Fenêtres du planning (conducteur + statut + plage de dates) — remplace
+  // l'ancien index (conducteurId, statut) dont il est un sur-ensemble.
+  @@index([conducteurId, statut, datePlanifiee])
+}
+
+// Ouvrier : fiche terrain. Historiquement sans compte (fiche imprimée) ;
+// depuis les comptes ouvriers (2026-07), l'accès app est un OPT-IN par fiche :
+// `userId` (nullable) relie la fiche à son compte User (posé au provisioning
+// de la 1re connexion via MembreAutorise.ouvrierId). Une fiche sans compte
+// reste 100 % valide. Désactivation douce via `actif` — coupe aussi l'accès
+// app (requireOuvrier/garderOuvrier) — jamais de suppression réelle s'il a
+// des affectations passées (historique des chantiers).
+model Ouvrier {
+  id        String   @id @default(uuid())
+  nom       String
+  telephone String?
+  actif     Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  // Compte applicatif lié (opt-in). User.id = auth.users.id.
+  userId String? @unique
+  user   User?   @relation("OuvrierCompte", fields: [userId], references: [id])
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+
+  affectations   AffectationChantier[]
+  absences       AbsenceOuvrier[]
+  membreAutorise MembreAutorise?
+
+  @@index([organisationId, actif])
+}
+
+// Absence d'un ouvrier en jours entiers — miroir d'Absence (conducteurs) :
+// minuit Europe/Paris, dateFin INCLUSE. Scoping org via l'ouvrier.
+model AbsenceOuvrier {
+  id        String   @id @default(uuid())
+  ouvrierId String
+  ouvrier   Ouvrier  @relation(fields: [ouvrierId], references: [id], onDelete: Cascade)
+
+  dateDebut DateTime
+  dateFin   DateTime
+  motif     String? // ≤ 200 caractères
+  createdAt DateTime @default(now())
+
+  @@index([ouvrierId, dateDebut])
+}
+
+// Chantier de travaux (post PRET_POUR_TRAVAUX) : 1 chantier = 1 dossier.
+// Granularité jour entier : [dateDebut, dateFin] en jours civils Paris,
+// bornes INCLUSES (mêmes conventions qu'Absence). L'avancement « à venir /
+// en cours / à clôturer » est DÉRIVÉ des dates (lib/chantiers.ts) — seul
+// « terminé » est un fait explicite, horodaté serveur.
+model Chantier {
+  id String @id @default(uuid())
+
+  // Le dossier passe EN_CHANTIER à la création, TERMINE au marquage terminé,
+  // et revient PRET_POUR_TRAVAUX si le chantier est supprimé (transactions).
+  dossierId String  @unique
+  dossier   Dossier @relation(fields: [dossierId], references: [id])
+
+  dateDebut DateTime // minuit Paris, inclus
+  dateFin   DateTime // minuit Paris, inclus (>= dateDebut)
+
+  // Pas de description/matériel : le détail des travaux vit sur le devis
+  // (version sans prix imprimée par l'assistante) — la fiche est logistique.
+
+  termineLe DateTime? // null = pas terminé ; posé/enlevé par action explicite
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // Dénormalisé (le dossier le porte déjà) : requêtes de fenêtre semaine
+  // directes sans jointure. Toujours cohérent avec dossier.organisationId.
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+
+  affectations AffectationChantier[]
+
+  @@index([organisationId, dateDebut])
+  // Page Historique : chantiers terminés triés par termineLe desc (seule vue
+  // à pagination profonde sur une table qui croît à vie).
+  @@index([organisationId, termineLe])
+}
+
+// Ouvriers assignés à un chantier (N-N). Pas de onDelete: Cascade côté
+// ouvrier : on refuse de supprimer un ouvrier affecté (désactivation à la place).
+model AffectationChantier {
+  chantierId String
+  chantier   Chantier @relation(fields: [chantierId], references: [id], onDelete: Cascade)
+
+  ouvrierId String
+  ouvrier   Ouvrier @relation(fields: [ouvrierId], references: [id])
+
+  @@id([chantierId, ouvrierId])
+  @@index([ouvrierId])
+}
+
+// Idempotence des webhooks Stripe : Stripe peut livrer un événement plusieurs
+// fois (et dans le désordre). L'id d'événement est inséré DANS LA MÊME
+// TRANSACTION que la mise à jour du miroir d'abonnement — une re-livraison
+// heurte la clé primaire (P2002) et l'événement est ignoré. Pas de scoping
+// org : la table est de la plomberie plateforme, pas une donnée tenant.
+model StripeEventTraite {
+  id       String   @id // event.id Stripe ("evt_…")
+  recuLe   DateTime @default(now())
+}
+
+// Note de suivi d'un dossier (« le client a rappelé », « reporté car
+// absent »…) — visible back-office ET conducteur (fiche visite : canal de
+// consignes bureau → terrain), jamais sur les documents client.
+// Scoping org via le dossier (même convention que Visite).
+model NoteDossier {
+  id        String   @id @default(uuid())
+  contenu   String // ≤ 2000 caractères (validé côté action)
+  createdAt DateTime @default(now())
+
+  dossierId String
+  dossier   Dossier @relation(fields: [dossierId], references: [id], onDelete: Cascade)
+
+  auteurId String
+  auteur   User   @relation("NoteAuteur", fields: [auteurId], references: [id])
+
+  @@index([dossierId, createdAt])
+}
+
+// Journal d'événements du dossier : « qui a fait quoi, quand ». Écrit dans la
+// MÊME transaction que la mutation qu'il trace (lib/evenements.ts), jamais
+// modifié ni supprimé ensuite. `meta` porte les détails spécifiques au type
+// (taux, motif, date prévue…) — affichage par lib/evenements.ts.
+enum TypeEvenementDossier {
+  CREATION
+  MODIFICATION_CLIENT
+  VISITE_PLANIFIEE
+  VISITE_REPLANIFIEE
+  VISITE_ANNULEE
+  COMPTE_RENDU_RECU
+  COMPTE_RENDU_CORRIGE
+  CLASSEMENT
+  EMPECHEMENT
+  CHANTIER_CREE
+  CHANTIER_MODIFIE
+  CHANTIER_TERMINE
+  CHANTIER_ROUVERT
+  CHANTIER_SUPPRIME
+  PIECE_JOINTE_AJOUTEE
+  PIECE_JOINTE_SUPPRIMEE
+  DEVIS_ENREGISTRE // saisie ou mise à jour des montants du devis (Tolteck)
+  PAIEMENT_RECU // dossier terminé marqué payé (horodate Dossier.payeLe)
+  PAIEMENT_ANNULE // marquage payé annulé (erreur de manipulation)
+  DOSSIER_ANNULE // dossier annulé (meta : motif, statutAvant)
+  DOSSIER_REPRIS // dossier repris — statut re-dérivé des visites (meta : statut)
+  DOCUMENT_A_SIGNER_AJOUTE // PDF à faire signer déposé par le back-office (meta : nom)
+  DOCUMENT_SIGNE // signé sur le terrain (meta : nom, nomSignataire)
+  DOCUMENT_A_SIGNER_SUPPRIME // retiré par le back-office (meta : nom)
+  CHANTIER_TERMINE_TERRAIN // chantier marqué terminé PAR L'OUVRIER (vs CHANTIER_TERMINE bureau)
+}
+
+model EvenementDossier {
+  id        String               @id @default(uuid())
+  type      TypeEvenementDossier
+  meta      Json?
+  createdAt DateTime             @default(now())
+
+  dossierId String
+  dossier   Dossier @relation(fields: [dossierId], references: [id], onDelete: Cascade)
+
+  acteurId String
+  acteur   User   @relation("EvenementActeur", fields: [acteurId], references: [id])
+
+  @@index([dossierId, createdAt])
+}
+
+// Notification in-app d'un utilisateur (conducteur : visite assignée /
+// replanifiée / annulée). Créée dans la MÊME transaction que la mutation
+// humaine qui la déclenche (à côté de l'EvenementDossier) — jamais déclenchée
+// par le temps (les relances automatiques sont une feature parquée). `meta`
+// porte les détails d'affichage (date prévue, adresse…) — rendu par
+// lib/notifications.ts.
+enum TypeNotification {
+  VISITE_ASSIGNEE
+  VISITE_REPLANIFIEE
+  VISITE_ANNULEE
+  // Miroir chantier pour l'ouvrier connecté (meta : chantierId, nomClient,
+  // adresse, dates) — créées par les actions chantier du back-office.
+  CHANTIER_AFFECTE
+  CHANTIER_REPLANIFIE
+  CHANTIER_RETIRE
+  // Flux documents à signer : l'ouvrier affecté reçoit le dépôt, chaque
+  // utilisateur back-office reçoit la signature (modèle mono-destinataire —
+  // on crée N notifications dans la transaction).
+  DOCUMENT_A_SIGNER_RECU
+  DOCUMENT_SIGNE_RECU
+  // Chantier marqué terminé depuis le terrain (destinataires : back-office).
+  CHANTIER_TERMINE_TERRAIN
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  type      TypeNotification
+  meta      Json?
+  lu        Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  destinataireId String
+  destinataire   User   @relation("NotificationDestinataire", fields: [destinataireId], references: [id], onDelete: Cascade)
+
+  // Optionnel : la notification survit à la suppression du dossier (meta garde
+  // de quoi rester lisible), le lien de navigation devient simplement mort.
+  dossierId String?
+  dossier   Dossier? @relation(fields: [dossierId], references: [id], onDelete: SetNull)
+
+  // Liste « mes notifications » (destinataire courant, non-lues d'abord).
+  @@index([destinataireId, lu, createdAt])
+}
+
+model Photo {
+  id        String   @id @default(uuid())
+  // Chemin de l'objet dans le bucket privé Storage (PAS une URL publique).
+  // Les URLs signées sont générées côté serveur au moment de l'affichage.
+  chemin    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  visiteId String
+  visite   Visite @relation(fields: [visiteId], references: [id], onDelete: Cascade)
+
+  @@index([visiteId])
+}
+
+// Pièce jointe d'un dossier hors photos de visite (devis, courrier, rapport…).
+// Même convention que Photo : `chemin` = objet du bucket privé Storage (PAS une
+// URL publique), les URLs signées de téléchargement sont générées côté serveur.
+// Scoping org via le dossier (comme NoteDossier). Ajout/suppression tracés au
+// journal (PIECE_JOINTE_AJOUTEE / PIECE_JOINTE_SUPPRIMEE).
+model PieceJointe {
+  id        String   @id @default(uuid())
+  nom       String // nom de fichier original affiché (≤ 255, validé côté action)
+  chemin    String // objet du bucket privé : organisationId/dossiers/dossierId/<uuid>.<ext>
+  mimeType  String
+  taille    Int // octets (borne côté action)
+  createdAt DateTime @default(now())
+
+  dossierId String
+  dossier   Dossier @relation(fields: [dossierId], references: [id], onDelete: Cascade)
+
+  ajouteParId String
+  ajoutePar   User   @relation("PieceJointeAuteur", fields: [ajouteParId], references: [id])
+
+  @@index([dossierId, createdAt])
+}
+
+// Document de fin de chantier à faire signer par le client sur le téléphone
+// de l'ouvrier (PV de fin de travaux…). Rattaché au DOSSIER comme PieceJointe
+// (le chantier est dérivable — 1 chantier max par dossier). PDF uniquement,
+// bucket privé : organisationId/dossiers/dossierId/a-signer/<uuid>.pdf.
+// Le statut « à signer / signé » est DÉRIVÉ de signeLe — aucun booléen à
+// cocher qui pourrait mentir. L'ORIGINAL n'est jamais supprimé ni modifié
+// (valeur probante) : la signature produit un SECOND objet (cheminSigne).
+model DocumentASigner {
+  id        String   @id @default(uuid())
+  nom       String // nom de fichier original affiché (≤ 255, validé côté action)
+  taille    Int // octets de l'original (borne côté action)
+  createdAt DateTime @default(now())
+
+  // Objet original + hash SHA-256 (hex) calculé serveur après upload —
+  // re-vérifié avant le tamponnage (prouve la non-altération).
+  cheminOriginal String
+  hashOriginal   String
+
+  // Posés à la signature (Route Handler /api/documents-a-signer/[id]/signer),
+  // jamais saisis : signeLe horodaté SERVEUR (philosophie dateRealisee).
+  cheminSigne   String?
+  hashSigne     String?
+  signeLe       DateTime?
+  nomSignataire String? // le client, saisi au moment de signer (≤ 200)
+
+  dossierId String
+  dossier   Dossier @relation(fields: [dossierId], references: [id], onDelete: Cascade)
+
+  ajouteParId String
+  ajoutePar   User   @relation("DocumentASignerAuteur", fields: [ajouteParId], references: [id])
+
+  // L'ouvrier qui a présenté le document à la signature.
+  signeParUserId String?
+  signePar       User?   @relation("DocumentASignerSignataire", fields: [signeParUserId], references: [id])
+
+  @@index([dossierId, createdAt])
+}
