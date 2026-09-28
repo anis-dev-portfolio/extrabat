@@ -14,7 +14,7 @@ Chaque point renvoie au fichier qui l'implémente. Les limites connues sont en f
 - **Guards côté serveur**, jamais seulement dans l'UI : `requireUser`, `requireRole`, `requireOuvrier`, `requireRoleActif` — `lib/auth.ts:111`, `:119`, `:135`, `:165`. Route Handlers mobiles : `garderConducteur` — `app/api/visites/[id]/garde.ts:9`.
 - **Scoping par organisation** : toute requête Prisma sur des données client filtre par `organisationId` issu de la session ; les entités liées sont re-vérifiées (invariant documenté dans `CLAUDE.md`, ex. `app/app/parametres/ouvriers/actions.ts`, `app/app/dossiers/actions.ts`).
 - **Frontière financière** : un compte `OUVRIER` ne reçoit jamais `montantDevis` / `franchise` / `refDevis` / `payeLe` (selects minimaux explicites — invariant `CLAUDE.md`) ; accès limité aux chantiers auxquels il est **affecté**.
-- **RLS Supabase** : les tables vivent dans `public`, exposé par la Data API de Supabase à la clé publique `anon`. L'app n'utilisant jamais cette API (Prisma pour les données), le RLS est activé **sans policy** sur les 18 tables et `_prisma_migrations` : `anon` / `authenticated` ne voient plus rien — `prisma/migrations/20260928113000_activer_rls/migration.sql`.
+- **RLS Supabase** : les tables vivent dans `public`, exposé par la Data API de Supabase à la clé publique `anon`. L'app n'utilisant jamais cette API (Prisma pour les données), le RLS est activé **sans policy** sur les 18 tables et `_prisma_migrations` : `anon` / `authenticated` ne voient aucune ligne — `prisma/migrations/20260928113000_activer_rls/migration.sql`. (En production, le RLS était déjà posé par le réglage d'activation automatique du projet Supabase ; la migration l'inscrit dans le code pour toute base neuve.)
 
 ## Secrets
 

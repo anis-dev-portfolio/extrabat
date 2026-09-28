@@ -2,8 +2,12 @@
 --
 -- Les tables vivent dans le schéma `public`, exposé par défaut par Supabase au
 -- rôle `anon` — dont la clé est publique par nature (embarquée côté navigateur,
--- lib/supabase/client.ts). Sans RLS, cette clé suffisait à lire et modifier
--- toutes les données via https://<projet>.supabase.co/rest/v1/<Table>.
+-- lib/supabase/client.ts). Les migrations n'activaient pas le RLS : en
+-- production, c'est le réglage « activation automatique du RLS » du projet
+-- Supabase qui le posait sur chaque nouvelle table. Cette migration l'inscrit
+-- dans le code, pour qu'une base neuve soit protégée sans dépendre de ce
+-- réglage (sinon la clé `anon` suffirait à lire et modifier toutes les données
+-- via https://<projet>.supabase.co/rest/v1/<Table>).
 --
 -- L'app n'utilise jamais la Data API : les données passent par Prisma, Supabase
 -- ne sert qu'à l'Auth et au Storage. On active donc le RLS SANS AUCUNE POLICY :

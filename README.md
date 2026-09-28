@@ -98,7 +98,7 @@ Webhooks Stripe en local : `stripe listen --forward-to localhost:3000/api/stripe
   - document signé jamais supprimable ;
   - webhooks Stripe insensibles à l'ordre de livraison ;
   - mot de passe propre à chaque ouvrier (au lieu d'un mot de passe commun) ;
-  - RLS activé sur toutes les tables.
+  - RLS inscrit dans les migrations (en production, il est déjà actif sur toutes les tables via le réglage d'activation automatique de Supabase).
 - **Ce qui manque** : tests automatisés et CI, rate limiting applicatif, CSP complète. Les correctifs du 28/09 sont vérifiés par typecheck, lint et build, pas encore exécutés contre une base.
 
 ---
